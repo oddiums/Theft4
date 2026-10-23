@@ -22,6 +22,9 @@
 #include "native_cpu_profile_scope.h"
 #include "native_profile_shader_category.h"
 #include "modern_shader_options.h"
+extern "C" {
+#include "libavcodec/texturedsp.h"
+}
 #ifdef THEFT4_BC_TEXTURE_COMPATIBILITY
 #include "theft4_astc_texture.h"
 #include "theft4_bc_compatibility.h"
@@ -18544,6 +18547,138 @@ Gta4NativeGraphicsSystem::NativeTextureImage* Gta4NativeGraphicsSystem::GetOrCre
     }
   }
 #endif
+#ifndef THEFT4_BC_TEXTURE_COMPATIBILITY
+  // Without the existing ASTC/BC preparation path, decode unsupported
+  // BC1/BC2/BC3 textures to RGBA8 before creating the Vulkan image.
+  const std::vector<uint8_t>* upload_payload = &texture->payload;
+  const std::vector<NativeTextureResource::MipLevel>* upload_mips = &texture->mip_levels;
+  std::vector<uint8_t> fallback_payload;
+  std::vector<NativeTextureResource::MipLevel> fallback_mips;
+  if ((format_properties.optimalTilingFeatures & kRequiredTextureFeatures) !=
+      kRequiredTextureFeatures) {
+    if (texture->gpu_produced) return reject("format-capabilities");
+
+    TextureDSPContext texture_dsp{};
+    ff_texturedsp_init(&texture_dsp);
+    int (*decode_block)(uint8_t*, ptrdiff_t, const uint8_t*) = nullptr;
+    size_t source_block_bytes = 0;
+    const char* fallback_format = nullptr;
+    switch (GetBaseFormat(texture->info.format)) {
+      case xenos::TextureFormat::k_DXT1:
+        if (format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK) {
+          decode_block = texture_dsp.dxt1a_block;
+          source_block_bytes = 8;
+          fallback_format = "BC1";
+        }
+        break;
+      case xenos::TextureFormat::k_DXT2_3:
+        if (format == VK_FORMAT_BC2_UNORM_BLOCK) {
+          decode_block = texture_dsp.dxt3_block;
+          source_block_bytes = 16;
+          fallback_format = "BC2";
+        }
+        break;
+      case xenos::TextureFormat::k_DXT4_5:
+        if (format == VK_FORMAT_BC3_UNORM_BLOCK) {
+          decode_block = texture_dsp.dxt5_block;
+          source_block_bytes = 16;
+          fallback_format = "BC3";
+        }
+        break;
+      default:
+        break;
+    }
+    if (!fallback_format) return reject("format-capabilities");
+    if (!decode_block) return reject("bc-fallback-init");
+
+    fallback_mips.reserve(texture->mip_levels.size());
+    for (const NativeTextureResource::MipLevel& mip : texture->mip_levels) {
+      if (!mip.width || !mip.height || !mip.depth ||
+          mip.payload_offset > texture->payload.size() ||
+          mip.payload_size > texture->payload.size() - mip.payload_offset) {
+        return reject("bc-fallback-mip");
+      }
+      const uint32_t blocks_x = (mip.width + 3) / 4;
+      const uint32_t blocks_y = (mip.height + 3) / 4;
+      const uint32_t source_blocks_per_row =
+          mip.buffer_row_length ? (mip.buffer_row_length + 3) / 4 : blocks_x;
+      const uint32_t source_block_rows =
+          mip.buffer_image_height ? (mip.buffer_image_height + 3) / 4 : blocks_y;
+      const uint64_t source_row_bytes =
+          uint64_t(source_blocks_per_row) * source_block_bytes;
+      const uint64_t source_slice_bytes =
+          uint64_t(source_block_rows) * source_row_bytes;
+      const uint64_t source_required = uint64_t(mip.depth) * source_slice_bytes;
+      if (source_blocks_per_row < blocks_x || source_block_rows < blocks_y ||
+          source_required > mip.payload_size) {
+        return reject("bc-fallback-layout");
+      }
+      const uint64_t decoded_size_64 =
+          uint64_t(mip.width) * mip.height * mip.depth * 4ull;
+      if (!decoded_size_64 || decoded_size_64 > kMaximumResourcePayloadSize ||
+          decoded_size_64 > uint64_t(std::numeric_limits<size_t>::max())) {
+        return reject("bc-fallback-size");
+      }
+      NativeTextureResource::MipLevel decoded_mip = mip;
+      decoded_mip.payload_offset = fallback_payload.size();
+      decoded_mip.payload_size = size_t(decoded_size_64);
+      decoded_mip.buffer_row_length = 0;
+      decoded_mip.buffer_image_height = 0;
+      if (decoded_mip.payload_size > kMaximumResourcePayloadSize ||
+          decoded_mip.payload_offset >
+              kMaximumResourcePayloadSize - decoded_mip.payload_size) {
+        return reject("bc-fallback-total-size");
+      }
+      fallback_payload.resize(decoded_mip.payload_offset + decoded_mip.payload_size);
+      const uint8_t* source = texture->payload.data() + mip.payload_offset;
+      uint8_t* destination = fallback_payload.data() + decoded_mip.payload_offset;
+      uint8_t decoded_block[4 * 4 * 4];
+      for (uint32_t z = 0; z < mip.depth; ++z) {
+        for (uint32_t block_y = 0; block_y < blocks_y; ++block_y) {
+          for (uint32_t block_x = 0; block_x < blocks_x; ++block_x) {
+            const uint8_t* source_block = source + size_t(z) * size_t(source_slice_bytes) +
+                size_t(block_y) * size_t(source_row_bytes) +
+                size_t(block_x) * source_block_bytes;
+            decode_block(decoded_block, 4 * 4, source_block);
+            for (uint32_t py = 0; py < 4; ++py) {
+              const uint32_t y = block_y * 4 + py;
+              if (y >= mip.height) break;
+              for (uint32_t px = 0; px < 4; ++px) {
+                const uint32_t x = block_x * 4 + px;
+                if (x >= mip.width) break;
+                const size_t source_pixel = size_t(py * 4 + px) * 4;
+                const size_t destination_pixel =
+                    ((size_t(z) * mip.height + y) * mip.width + x) * 4;
+                std::memcpy(destination + destination_pixel,
+                            decoded_block + source_pixel, 4);
+              }
+            }
+          }
+        }
+      }
+      fallback_mips.push_back(decoded_mip);
+    }
+    upload_payload = &fallback_payload;
+    upload_mips = &fallback_mips;
+    format = VK_FORMAT_R8G8B8A8_UNORM;
+    format_properties = GetNativeFormatProperties(format);
+    if ((format_properties.optimalTilingFeatures & kRequiredTextureFeatures) !=
+        kRequiredTextureFeatures) {
+      return reject("bc-fallback-format-capabilities");
+    }
+    static std::atomic<uint64_t> bc_fallback_count{0};
+    const uint64_t fallback_index =
+        bc_fallback_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (fallback_index <= 64 || !(fallback_index % 4096)) {
+      REXLOG_INFO(
+          "gta4-native-diag: {}->RGBA8 fallback #{} handle={:08X} "
+          "generation={} size={}x{} source-bytes={} decoded-bytes={}",
+          fallback_format, fallback_index, texture->handle, texture->generation,
+          texture->info.width + 1, texture->info.height + 1,
+          texture->payload.size(), fallback_payload.size());
+    }
+  }
+#endif
   if ((format_properties.optimalTilingFeatures & kRequiredTextureFeatures) !=
       kRequiredTextureFeatures) {
     return reject("format-capabilities");
@@ -18568,7 +18703,7 @@ Gta4NativeGraphicsSystem::NativeTextureImage* Gta4NativeGraphicsSystem::GetOrCre
 #ifdef THEFT4_BC_TEXTURE_COMPATIBILITY
     CaptureMetalTexture(*image, *upload_payload, *upload_mips);
 #else
-    CaptureMetalTexture(*image, texture->payload, texture->mip_levels);
+    CaptureMetalTexture(*image, *upload_payload, *upload_mips);
 #endif
   };
   capture_prepared_texture();
@@ -18678,8 +18813,8 @@ Gta4NativeGraphicsSystem::NativeTextureImage* Gta4NativeGraphicsSystem::GetOrCre
     const auto& payload_to_upload = *upload_payload;
     const auto& mips_to_upload = *upload_mips;
     #else
-    const auto& payload_to_upload = texture->payload;
-    const auto& mips_to_upload = texture->mip_levels;
+    const auto& payload_to_upload = *upload_payload;
+    const auto& mips_to_upload = *upload_mips;
     #endif
     if (!AllocateUpload(payload_to_upload.size(), 16, upload, NativeUploadKind::kTexture)) {
       DestroyNativeTextureImage(*image);
