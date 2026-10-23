@@ -235,7 +235,8 @@ if(THEFT4_ENABLE_GAME_STARTUP)
             "${CMAKE_SOURCE_DIR}/glue/rexglue-sdk-main/thirdparty/vulkan-memory-allocator/include")
         target_link_libraries(theft4_gta4_native_compile PRIVATE
             rex::runtime
-            xxHash::xxhash)
+            xxHash::xxhash
+            libavcodec)
         if(THEFT4_BC_TEXTURE_COMPATIBILITY)
             set(ASTCENC_CLI OFF CACHE BOOL "" FORCE)
             set(ASTCENC_UNITTEST OFF CACHE BOOL "" FORCE)
